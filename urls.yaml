@@ -1,0 +1,8 @@
+name: Example.com
+command: curl -fsS 'https://example.com'
+---
+name: Arch Linux News
+command: curl -fsS 'https://archlinux.org/' | xq -q '.article-content > p'
+---
+name: Local File Check
+command: cat '/path/to/important/file.txt'

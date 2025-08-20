@@ -1,0 +1,393 @@
+#!/usr/bin/env bash
+
+# bash-url-watch: A simple script to monitor command output for changes.
+# Supports variable substitution from a global config file.
+VERSION="0.5.0"
+
+# ==============================================================================
+# == Environment
+# ==============================================================================
+# The script will use sensible defaults if XDG variables are not set.
+XDG_DATA_HOME="${XDG_DATA_HOME:-${HOME}/.local/share}"
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}"
+
+# ==============================================================================
+# == Configuration
+# ==============================================================================
+# State directory path. Can be overridden by setting BASH_URL_WATCH_STATE_DIR.
+STATE_DIR="${BASH_URL_WATCH_STATE_DIR:-${HOME}/.local/state/bash-url-watch}"
+# Default configuration file locations. Can be overridden with flags.
+DEFAULT_URLS_FILE="${XDG_CONFIG_HOME}/bash-url-watch/urls.yaml"
+DEFAULT_GLOBALS_FILE="${XDG_CONFIG_HOME}/bash-url-watch/globals.conf"
+
+# ==============================================================================
+# == Constants & Colors
+# ==============================================================================
+GREEN=$(printf '\033[0;32m')
+RED=$(printf '\033[0;31m')
+YELLOW=$(printf '\033[1;33m')
+CYAN=$(printf '\033[0;36m')
+MAGENTA=$(printf '\033[0;35m')
+NC=$(printf '\033[0m') # No Color
+SEPARATOR=$(printf '=%.0s' {1..80})
+
+# ==============================================================================
+# == Functions
+# ==============================================================================
+
+# Displays help information.
+function usage() {
+	echo "Usage: $(basename "$0") [options]"
+	echo
+	echo "Monitors command output for changes based on a YAML configuration file."
+	echo "Supports %%%VAR_NAME%%% substitution from a global variables file."
+	echo
+	echo "Options:"
+	echo "  -u, --urls <file>     Specify a custom URLs YAML file path."
+	echo "  -c, --globals <file>  Specify a custom global variables config file."
+	echo "  -k, --check <number>  Check a specific entry by its number from the list."
+	echo "  -l, --list            List all configured jobs with their numbers."
+	echo "  -a, --all             Show output for all jobs, even those with no changes."
+	echo "  -n, --no-color        Disable color output (auto-enabled in non-interactive sessions)."
+	echo "      --clean           Remove old state files for jobs no longer in the config."
+	echo "      --no-summary      Hide the final summary report."
+	echo "      --completion      Generate the bash completion script."
+	echo "  -v, --version         Show script version."
+	echo "  -h, --help            Show this help message."
+}
+
+# Generates the bash completion script and prints it to stdout.
+function generate_completion_script() {
+	cat << 'EOF'
+# bash completion for bash-url-watch
+
+_bash_url_watch() {
+	local cur prev opts
+	COMPREPLY=()
+	cur="${COMP_WORDS[COMP_CWORD]}"
+	prev="${COMP_WORDS[COMP_CWORD-1]}"
+	opts="--all -a --clean --urls -u --globals -c --check -k --help -h --list -l --no-color -n --no-summary --version -v --completion"
+
+	case "${prev}" in
+		--urls|-u|--globals|-c)
+			COMPREPLY=( $(compgen -f -- "${cur}") )
+			return 0
+			;;
+		--check|-k)
+			# User must provide a number. No dynamic suggestions for simplicity.
+			return 0
+			;;
+	esac
+
+	# Suggest options for words starting with a dash.
+	if [[ ${cur} == -* ]];
+	then
+		COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+		return 0
+	fi
+}
+
+complete -F _bash_url_watch bash-url-watch
+EOF
+}
+
+
+# Checks for required command-line tools.
+function _check_dependencies() {
+	local ERROR_CODE=0
+	local DEPENDS
+	# shellcheck disable=SC2068
+	for DEPENDS in $@; do
+		command -v "${DEPENDS}" >/dev/null ||
+		{
+			echo -e "${RED}==> ${DEPENDS} is not installed${NC}"
+			ERROR_CODE=1
+		}
+	done
+	[[ "${ERROR_CODE}" -eq 0 ]] ||
+	exit 1
+}
+
+# Converts a string into a safe, reusable filename.
+function slugify() {
+	echo "${1}" | tr '[:upper:]' '[:lower:]' |
+	tr -cs 'a-z0-9' '-' | sed 's/--\+/-/g; s/^-//; s/-$//'
+}
+
+# Applies global variables to a command string using a pre-populated array of keys.
+function _apply_global_vars() {
+	local COMMAND_STRING="${1}"
+	
+	# 1. Process all variables from the globals.conf file
+	for VAR_NAME in "${GLOBAL_VAR_NAMES[@]}"; do
+		local VALUE="${!VAR_NAME}"
+		local QUOTED_VALUE
+		QUOTED_VALUE=$(printf %q "${VALUE}")
+		COMMAND_STRING="${COMMAND_STRING//%%%${VAR_NAME}%%%/${QUOTED_VALUE}}"
+	done
+	
+	# 2. Process the internal reserved variable for the script's identity
+	local SCRIPT_IDENTITY
+	SCRIPT_IDENTITY="$(basename "$0") v${VERSION}"
+	local QUOTED_SCRIPT_IDENTITY
+	QUOTED_SCRIPT_IDENTITY=$(printf %q "${SCRIPT_IDENTITY}")
+	COMMAND_STRING="${COMMAND_STRING//%%%SCRIPT_IDENTITY%%%/${QUOTED_SCRIPT_IDENTITY}}"
+	
+	echo "${COMMAND_STRING}"
+}
+
+# Removes state files that do not correspond to any job in the current config.
+function clean_state_files() {
+	echo "Checking for old state files to clean..."
+	echo "Reading job names from: ${URLS_FILE}"
+
+	# Use a standard loop to populate the array, which is more robust.
+	local -a CURRENT_SLUGS=() # Explicitly declare an empty array
+	while IFS= read -r NAME;
+	do
+		local SLUG
+		SLUG=$(slugify "${NAME}")
+		# Add the slug to the array only if it's not an empty string
+		if [[ -n "${SLUG}" ]];
+		then
+			CURRENT_SLUGS+=("${SLUG}")
+		fi
+	done < <(yq e -N '.name' "${URLS_FILE}")
+
+	# --- CRITICAL SAFETY CHECK ---
+	if [[ ${#CURRENT_SLUGS[@]} -eq 0 ]];
+	then
+		echo -e "${RED}Error: Could not read any valid job names from the config file.${NC}"
+		echo -e "${YELLOW}Aborting --clean operation to prevent data loss.${NC}"
+		return 1
+	fi
+
+	local FOUND_OLD=0
+	for STATE_FILE_PATH in "${STATE_DIR}"/*;
+	do
+		if [[ -f "${STATE_FILE_PATH}" ]]; then
+			local STATE_FILENAME
+			STATE_FILENAME=$(basename "${STATE_FILE_PATH}")
+			if ! [[ " ${CURRENT_SLUGS[*]} " =~ " ${STATE_FILENAME} " ]];
+			then
+				echo -e "  ${YELLOW}Removing unused state file:${NC} ${STATE_FILENAME}"
+				rm "${STATE_FILE_PATH}"
+				FOUND_OLD=1
+			fi
+		fi
+	done
+
+	if [[ ${FOUND_OLD} -eq 0 ]];
+	then
+		echo "No old state files found."
+	fi
+	echo "Clean-up complete."
+}
+
+# Executes a single check and reports ONLY if there is a change, error, or --all is set.
+function run_check() {
+	local NAME="${1}"
+	local COMMAND="${2}"
+	local SLUG
+	SLUG=$(slugify "${NAME}")
+	local STATE_FILE="${STATE_DIR}/${SLUG}"
+
+	local NEW_OUTPUT
+	NEW_OUTPUT=$(eval "${COMMAND}" 2>/dev/null)
+	local COMMAND_EXIT_CODE=$?
+
+	local REPORT_MESSAGE=""
+
+	if [[ ${COMMAND_EXIT_CODE} -ne 0 ]];
+	then
+		((COUNT_ERROR++))
+		REPORT_MESSAGE="${YELLOW}Warning: Command for '${NAME}' failed with exit code ${COMMAND_EXIT_CODE}.${NC}"
+	elif [[ ! -f "${STATE_FILE}" ]];
+	then
+		((COUNT_ADDED++))
+		REPORT_MESSAGE="${GREEN}New item added. Initial state saved.${NC}"
+		echo "${NEW_OUTPUT}" > "${STATE_FILE}"
+	else
+		local DIFF_RENDERED
+		# Generate the diff output. The command used depends on whether color is enabled.
+		if [[ ${IS_INTERACTIVE} -eq 1 ]]; then
+			if command -v colordiff &> /dev/null; then
+				DIFF_RENDERED=$(colordiff -u "${STATE_FILE}" <(echo "${NEW_OUTPUT}"))
+			else
+				DIFF_RENDERED=$(diff --color=always -u "${STATE_FILE}" <(echo "${NEW_OUTPUT}"))
+			fi
+		else
+			DIFF_RENDERED=$(diff -u "${STATE_FILE}" <(echo "${NEW_OUTPUT}"))
+		fi
+
+		# If the diff output is not empty, there was a change.
+		if [[ -n "${DIFF_RENDERED}" ]];
+		then
+			((COUNT_CHANGED++))
+			REPORT_MESSAGE="${YELLOW}Change detected!${NC}\n\n${DIFF_RENDERED}"
+			echo "${NEW_OUTPUT}" > "${STATE_FILE}"
+		elif [[ ${SHOW_ALL} -eq 1 ]];
+		then
+			REPORT_MESSAGE="No change."
+		fi
+	fi
+
+	# Only print the report if there is something to say.
+	if [[ -n "${REPORT_MESSAGE}" ]];
+	then
+		# If the previous check was silent, print a separator to start this block.
+		if [[ -z "${PREVIOUS_CHECK_HAD_OUTPUT}" ]];
+		then
+			echo -e "${MAGENTA}${SEPARATOR}${NC}"
+		fi
+
+		echo -e "${CYAN}Checking: ${NAME}${NC}"
+		echo -e "${REPORT_MESSAGE}"
+		echo -e "${MAGENTA}${SEPARATOR}${NC}"
+
+		PREVIOUS_CHECK_HAD_OUTPUT=true
+	else
+		# Unset the flag if the check was silent, so the next report gets a top separator.
+		unset PREVIOUS_CHECK_HAD_OUTPUT
+	fi
+}
+
+# ==============================================================================
+# == Main Script Logic
+# ==============================================================================
+
+# --- TTY Detection ---
+IS_INTERACTIVE=0
+if [[ -t 1 ]];
+then
+	IS_INTERACTIVE=1
+fi
+
+# --- Argument Parsing ---
+URLS_FILE="${DEFAULT_URLS_FILE}"
+GLOBALS_FILE="${DEFAULT_GLOBALS_FILE}"
+SHOW_ALL=0
+CLEAN_MODE=0
+LIST_MODE=0
+CHECK_NUMBER=-1
+SHOW_SUMMARY=1
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		-u|--urls)      URLS_FILE="$2"; shift 2 ;;
+		-c|--globals)   GLOBALS_FILE="$2"; shift 2 ;;
+		-k|--check)     CHECK_NUMBER="$2"; shift 2 ;;
+		-l|--list)      LIST_MODE=1; shift ;;
+		-a|--all)       SHOW_ALL=1; shift ;;
+		-n|--no-color)  IS_INTERACTIVE=0; shift ;;
+		--clean)        CLEAN_MODE=1; shift ;;
+		--no-summary)   SHOW_SUMMARY=0; shift ;;
+		--completion)   generate_completion_script; exit 0 ;;
+		-v|--version)   echo "$(basename "$0") version ${VERSION}"; exit 0 ;;
+		-h|--help)      usage; exit 0 ;;
+		*)              echo "Unknown option: $1"; usage;
+		exit 1 ;;
+	esac
+done
+
+# --- Finalize Settings ---
+if [[ ${IS_INTERACTIVE} -eq 0 ]];
+then
+	GREEN=""
+	RED=""
+	YELLOW=""
+	CYAN=""
+	MAGENTA=""
+	NC=""
+fi
+
+# --- Pre-run Checks ---
+_check_dependencies yq
+if [[ ! -f "${URLS_FILE}" ]];
+then
+	echo -e "${RED}==> Missing URLs config file: ${URLS_FILE}${NC}"
+	exit 1
+fi
+mkdir -p "${STATE_DIR}"
+
+# --- Mode Handling ---
+if [[ ${CLEAN_MODE} -eq 1 ]];
+then
+	clean_state_files
+	exit 0
+fi
+
+# Load jobs from config into arrays for indexed access
+mapfile -t JOB_NAMES < <(yq e -N '.name' "${URLS_FILE}")
+mapfile -t JOB_COMMANDS < <(yq e -N '.command' "${URLS_FILE}")
+
+if [[ ${LIST_MODE} -eq 1 ]];
+then
+	echo "Available jobs in ${URLS_FILE}:"
+	for i in "${!JOB_NAMES[@]}"; do
+		printf "  ${YELLOW}[%d]${NC} %s\n" "$((i+1))" "${JOB_NAMES[$i]}"
+	done
+	exit 0
+fi
+
+# --- Source Global Vars & Prepare Keys ---
+declare -a GLOBAL_VAR_NAMES=()
+if [[ -f "${GLOBALS_FILE}" ]]; then
+	# shellcheck disable=SC1090
+	source "${GLOBALS_FILE}"
+	# Parse the file to get the variable names for substitution.
+	mapfile -t GLOBAL_VAR_NAMES < <(grep -E '^[a-zA-Z_][a-zA-Z0-9_]*=' "${GLOBALS_FILE}" | cut -d'=' -f1)
+fi
+
+# --- Processing Loop & Stats ---
+COUNT_ADDED=0
+COUNT_CHANGED=0
+COUNT_ERROR=0
+JOBS_TO_RUN_COUNT=0
+unset PREVIOUS_CHECK_HAD_OUTPUT # Ensure the flag is reset before the loop
+
+if [[ ${CHECK_NUMBER} -gt -1 ]];
+then
+	JOBS_TO_RUN_COUNT=1
+	INDEX=$((CHECK_NUMBER - 1))
+	if [[ -n "${JOB_NAMES[INDEX]}" ]]; then
+		COMMAND_TO_RUN=$(_apply_global_vars "${JOB_COMMANDS[INDEX]}")
+		run_check "${JOB_NAMES[INDEX]}" "${COMMAND_TO_RUN}"
+	else
+		echo -e "${RED}Error: Invalid check number '${CHECK_NUMBER}'. Use --list to see available jobs.${NC}"
+		exit 1
+	fi
+else
+	JOBS_TO_RUN_COUNT=${#JOB_NAMES[@]}
+	for i in "${!JOB_NAMES[@]}";
+	do
+		COMMAND_TO_RUN=$(_apply_global_vars "${JOB_COMMANDS[i]}")
+		run_check "${JOB_NAMES[i]}" "${COMMAND_TO_RUN}"
+	done
+fi
+
+# --- Final Summary ---
+if [[ ${SHOW_SUMMARY} -eq 1 ]];
+then
+	COUNT_NO_CHANGE=$((JOBS_TO_RUN_COUNT - COUNT_ADDED - COUNT_CHANGED - COUNT_ERROR))
+
+	# Dynamically create a centered title within the separator
+	TITLE="${CYAN} Summary ${MAGENTA}" # Add color to the title text
+	SEP_LEN=80
+	# The literal title length, ignoring color codes, for accurate padding calculation
+	TITLE_TEXT_LEN=9
+	PAD_LEFT=$(( (SEP_LEN - TITLE_TEXT_LEN) / 2 ))
+	PAD_RIGHT=$(( SEP_LEN - TITLE_TEXT_LEN - PAD_LEFT ))
+	BORDER_LEFT=$(printf '=%.0s' $(seq 1 ${PAD_LEFT}))
+	BORDER_RIGHT=$(printf '=%.0s' $(seq 1 ${PAD_RIGHT}))
+	SUMMARY_HEADER="${MAGENTA}${BORDER_LEFT}${TITLE}${BORDER_RIGHT}${NC}"
+
+	echo # Add a blank line for spacing before the summary
+	echo -e "${SUMMARY_HEADER}"
+	echo -e "  Checked:   ${JOBS_TO_RUN_COUNT}"
+	echo -e "  Added:     ${GREEN}${COUNT_ADDED}${NC}"
+	echo -e "  Changed:   ${YELLOW}${COUNT_CHANGED}${NC}"
+	echo -e "  Unchanged: ${GREEN}${COUNT_NO_CHANGE}${NC}"
+	echo -e "  Errors:    ${RED}${COUNT_ERROR}${NC}"
+	echo -e "${MAGENTA}${SEPARATOR}${NC}"
+fi

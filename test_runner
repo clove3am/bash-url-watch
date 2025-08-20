@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+
+# A test runner for the bash-url-watch script.
+
+# --- Configuration ---
+# The script we are testing
+SCRIPT_TO_TEST="./bash-url-watch"
+# Dynamically get the version from the script to make tests more robust
+SCRIPT_VERSION=$(grep '^VERSION=' "${SCRIPT_TO_TEST}" | cut -d'=' -f2 | tr -d '"')
+
+# --- Colors for Output ---
+GREEN=$(printf '\033[0;32m')
+RED=$(printf '\033[0;31m')
+NC=$(printf '\033[0m')
+
+# --- Global Test Variables ---
+# Create a temporary directory for our test environment
+TEST_DIR=$(mktemp -d)
+TEST_URLS_CONFIG="${TEST_DIR}/test_urls.yaml"
+TEST_GLOBALS_CONFIG="${TEST_DIR}/globals.conf"
+TEST_STATE_DIR="${TEST_DIR}/state"
+TEST_SOURCE_DIR="${TEST_DIR}/source_files"
+
+# Counter for tests
+TEST_COUNT=0
+FAIL_COUNT=0
+
+# --- Helper Functions ---
+
+# This function runs before any tests
+function setup() {
+	echo "Setting up test environment in: ${TEST_DIR}"
+	mkdir -p "${TEST_STATE_DIR}"
+	mkdir -p "${TEST_SOURCE_DIR}"
+
+	# Export the state dir path so the script under test will use it
+	export BASH_URL_WATCH_STATE_DIR="${TEST_STATE_DIR}"
+
+	# Create dummy source files
+	echo "initial content" > "${TEST_SOURCE_DIR}/file1.txt"
+	echo "unchanged" > "${TEST_SOURCE_DIR}/file2.txt"
+	echo "color" > "${TEST_SOURCE_DIR}/color_test.txt" # New file for color test
+
+	# Create a dummy globals config file for variable substitution tests
+	echo 'TEST_VAR="hello world"' > "${TEST_GLOBALS_CONFIG}"
+
+	# Create a dummy YAML config file using the original document separator format
+	cat > "${TEST_URLS_CONFIG}" << EOF
+name: Test - Detect Change
+command: cat "${TEST_SOURCE_DIR}/file1.txt"
+---
+name: Test - No Change
+command: cat "${TEST_SOURCE_DIR}/file2.txt"
+---
+name: Test - Command Error
+command: cat "${TEST_SOURCE_DIR}/nonexistent_file.txt"
+---
+name: Test - Global Var
+command: echo value is %%%TEST_VAR%%%
+---
+name: Test - Script Identity Var
+command: echo identity is %%%SCRIPT_IDENTITY%%%
+---
+name: Test - Color Diff
+command: cat "${TEST_SOURCE_DIR}/color_test.txt"
+EOF
+}
+
+function slugify() {
+	echo "${1}" | tr '[:upper:]' '[:lower:]' |
+	tr -cs 'a-z0-9' '-' | sed 's/--\+/-/g; s/^-//; s/-$//'
+}
+
+# This function runs after all tests, even if they fail
+function teardown() {
+	echo "Tearing down test environment."
+	rm -rf "${TEST_DIR}"
+}
+
+# This is our core assertion function. It runs a command and checks the result.
+function run_test() {
+	local DESCRIPTION="$1"
+	local COMMAND_TO_RUN="$2"
+	local EXPECTED_OUTPUT="$3"
+	local EXPECTED_EXIT_CODE="$4"
+	
+	((TEST_COUNT++))
+	printf "Running test: %s... " "${DESCRIPTION}"
+
+	# Run the command and capture its output and exit code
+	local RAW_OUTPUT
+	RAW_OUTPUT=$(eval "${COMMAND_TO_RUN}" 2>&1)
+	local ACTUAL_EXIT_CODE=$?
+	# Strip ANSI color codes for reliable comparison
+	local CLEAN_OUTPUT
+	# shellcheck disable=SC2001
+	CLEAN_OUTPUT=$(echo "${RAW_OUTPUT}" | sed 's/\x1b\[[0-9;]*m//g')
+
+	# Check exit code
+	if [[ ${ACTUAL_EXIT_CODE} -ne ${EXPECTED_EXIT_CODE} ]];
+	then
+		((FAIL_COUNT++))
+		printf '%sFAIL%s\n' "${RED}" "${NC}"
+		echo "  - Expected exit code ${EXPECTED_EXIT_CODE}, but got ${ACTUAL_EXIT_CODE}"
+		echo "  - Output was: ${RAW_OUTPUT}"
+		return
+	fi
+
+	# Check output (using grep for partial matches)
+	if ! echo "${CLEAN_OUTPUT}" | grep -qF "${EXPECTED_OUTPUT}"; then
+		((FAIL_COUNT++))
+		printf '%sFAIL%s\n' "${RED}" "${NC}"
+		echo "  - Output did not contain expected string: '${EXPECTED_OUTPUT}'"
+		echo "  - Full (raw) output was: ${RAW_OUTPUT}"
+		return
+	fi
+
+	printf '%sPASS%s\n' "${GREEN}" "${NC}"
+}
+
+# --- Test Cases ---
+
+function test_basic_flags() {
+	echo
+	echo "--- Testing Basic Flags ---"
+	run_test "Should show version" \
+		"'${SCRIPT_TO_TEST}' --version" \
+		"version ${SCRIPT_VERSION}" 0
+
+	run_test "Should show help" \
+		"'${SCRIPT_TO_TEST}' --help" \
+		"Usage: bash-url-watch" 0
+
+	run_test "Should generate completion script" \
+		"'${SCRIPT_TO_TEST}' --completion" \
+		"complete -F _bash_url_watch bash-url-watch" 0
+
+	run_test "Should list jobs" \
+		"'${SCRIPT_TO_TEST}' --urls '${TEST_URLS_CONFIG}' --list" \
+		"[1] Test - Detect Change" 0
+}
+
+function test_no_color_flag() {
+	echo
+	echo "--- Testing No-Color Flag ---"
+	((TEST_COUNT++))
+	printf "Running test: Should disable color output... "
+
+	# --- Setup for this specific test ---
+	local TEST_NAME="Test - Color Diff"
+	local SLUG
+	SLUG=$(slugify "${TEST_NAME}")
+	rm -f "${TEST_STATE_DIR}/${SLUG}"
+
+	local TEST_FILE="${TEST_SOURCE_DIR}/color_test.txt"
+	local CHECK_NUMBER=6 # This is the 6th job in the YAML
+
+	# 1. Establish initial state for just this one job
+	"${SCRIPT_TO_TEST}" --urls "${TEST_URLS_CONFIG}" --no-summary --check ${CHECK_NUMBER} > /dev/null
+
+	# 2. Trigger a change
+	echo "change" >> "${TEST_FILE}"
+
+	# --- Assertions ---
+	# 3. Run with color, forcing a pseudo-terminal so color is enabled
+	local COMMAND_TO_RUN="'${SCRIPT_TO_TEST}' --urls '${TEST_URLS_CONFIG}' --no-summary --check ${CHECK_NUMBER}"
+	# The 'script' command tricks the program into thinking it's in a TTY.
+	# We also strip carriage returns (\r) that 'script' can sometimes add.
+	local COLOR_OUTPUT
+	COLOR_OUTPUT=$(script -q -c "${COMMAND_TO_RUN}" /dev/null | tr -d '\r')
+
+	if ! echo "${COLOR_OUTPUT}" | grep -q $'\x1b'; then
+		((FAIL_COUNT++))
+		printf '%sFAIL%s\n' "${RED}" "${NC}"
+		echo "  - Default output did not contain expected ANSI color codes."
+		return
+	fi
+
+	# 4. Run with --no-color and check for the ABSENCE of ANSI codes
+	local NO_COLOR_OUTPUT
+	NO_COLOR_OUTPUT=$("${SCRIPT_TO_TEST}" --urls "${TEST_URLS_CONFIG}" --no-summary --no-color --check ${CHECK_NUMBER})
+	if echo "${NO_COLOR_OUTPUT}" | grep -q $'\x1b'; then
+		((FAIL_COUNT++))
+		printf '%sFAIL%s\n' "${RED}" "${NC}"
+		echo "  - Output with --no-color flag contained unexpected ANSI color codes."
+		return
+	fi
+
+	printf '%sPASS%s\n' "${GREEN}" "${NC}"
+}
+
+function test_variable_substitution() {
+	echo
+	echo "--- Testing Variable Substitution ---"
+	# Ensure a clean state before these tests
+	rm -f "${TEST_STATE_DIR}"/*
+
+	# Test 1: Check the global variable from the conf file
+	local TEST_NAME_1="Test - Global Var"
+	local SLUG_1
+	SLUG_1=$(slugify "${TEST_NAME_1}")
+	local STATE_FILE_1="${TEST_STATE_DIR}/${SLUG_1}"
+	# Run the script once to generate the state file
+	"${SCRIPT_TO_TEST}" --urls "${TEST_URLS_CONFIG}" --globals "${TEST_GLOBALS_CONFIG}" --no-summary --check 4 > /dev/null
+	# Now, run a test to verify the state file's content
+	run_test "Should create correct state file for global var" \
+		"cat '${STATE_FILE_1}'" "value is hello world" 0
+
+	# Test 2: Check the reserved SCRIPT_IDENTITY variable
+	local TEST_NAME_2="Test - Script Identity Var"
+	local SLUG_2
+	SLUG_2=$(slugify "${TEST_NAME_2}")
+	local STATE_FILE_2="${TEST_STATE_DIR}/${SLUG_2}"
+	# Run the script once to generate the state file
+	"${SCRIPT_TO_TEST}" --urls "${TEST_URLS_CONFIG}" --no-summary --check 5 > /dev/null
+	# Now, run a test to verify the state file's content
+	run_test "Should create correct state file for SCRIPT_IDENTITY" \
+		"cat '${STATE_FILE_2}'" "identity is bash-url-watch v${SCRIPT_VERSION}" 0
+}
+
+function test_new_item_detection() {
+	echo
+	echo "--- Testing New Item Detection ---"
+	# Ensure a clean state for this test function
+	rm -f "${TEST_STATE_DIR}"/*
+
+	# On the first full run, with 6 jobs, we expect 5 to be added and 1 to error.
+	run_test "Summary should count 5 added items on first run" \
+		"'${SCRIPT_TO_TEST}' --urls '${TEST_URLS_CONFIG}' --globals '${TEST_GLOBALS_CONFIG}'" \
+		"Added:     5" 0
+}
+
+function test_core_logic() {
+	echo
+	echo "--- Testing Core Logic (Changes & Errors) ---"
+
+	# Ensure a clean state for this test function
+	rm -f "${TEST_STATE_DIR}"/*
+	
+	# 1. First run to establish initial state for all items
+	echo "Performing initial run to establish state..."
+	"${SCRIPT_TO_TEST}" --urls "${TEST_URLS_CONFIG}" --globals "${TEST_GLOBALS_CONFIG}" --no-summary --all > /dev/null
+	
+	# 2. Modify a source file to trigger a change
+	echo "new line" >> "${TEST_SOURCE_DIR}/file1.txt"
+	
+	# 3. Run a full check and verify the summary is correct.
+	# With 5 jobs, we expect 1 change, 3 unchanged, and 1 error.
+	run_test "Summary should count 1 change, 3 unchanged, and 1 error" \
+		"'${SCRIPT_TO_TEST}' --urls '${TEST_URLS_CONFIG}' --globals '${TEST_GLOBALS_CONFIG}'" \
+		"Changed:   1" 0
+}
+
+function test_clean_flag() {
+	echo
+	echo "--- Testing Clean Flag ---"
+	
+	# Create an orphaned state file
+	touch "${TEST_STATE_DIR}/old-orphaned-file"
+	
+	run_test "Should remove orphaned state file" \
+		"'${SCRIPT_TO_TEST}' --urls '${TEST_URLS_CONFIG}' --clean" \
+		"Removing unused state file: old-orphaned-file" 0
+}
+
+
+# --- Main Execution ---
+
+# Ensure teardown runs even if the script is interrupted
+trap teardown EXIT
+
+setup
+
+# Run all our test functions in a logical order
+test_basic_flags
+test_variable_substitution
+test_no_color_flag
+test_new_item_detection
+test_core_logic
+test_clean_flag
+
+# Final report
+echo
+if [[ ${FAIL_COUNT} -eq 0 ]];
+then
+	printf '%sAll %s tests passed!%s 👍\n' "${GREEN}" "${TEST_COUNT}" "${NC}"
+else
+	printf '%s%s of %s tests failed.%s\n' "${RED}" "${FAIL_COUNT}" "${TEST_COUNT}" "${NC}"
+	exit 1
+fi

@@ -121,3 +121,11 @@ For example, to run it every 30 minutes:
 ```
 */30 * * * * /usr/local/bin/bash-url-watch --no-color --no-summary
 ```
+
+## Contributing
+
+Contributions to improve the script are welcome! Please feel free to submit issues or pull requests on the project's repository.
+
+## License
+
+This script is released under the MIT License. See the [LICENSE](LICENSE) file for details.

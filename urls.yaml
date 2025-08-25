@@ -2,7 +2,7 @@ name: Example.com
 command: curl -fsS 'https://example.com'
 ---
 name: Arch Linux News
-command: curl -fsS 'https://archlinux.org/' | xq -q '.article-content > p'
+command: curl -fsS 'https://archlinux.org/' |  xq -q '.article-content > p'
 ---
-name: Local File Check
-command: cat '/path/to/important/file.txt'
+name: Check API with Custom User-Agent
+command: curl -fsSA %%%SCRIPT_IDENTITY%%% %%%MY_API_URL%%%

@@ -246,9 +246,9 @@ function run_check() {
 		echo -e "${MAGENTA}${SEPARATOR}${NC}"
 
 		PREVIOUS_CHECK_HAD_OUTPUT=true
-	else
-		# Unset the flag if the check was silent, so the next report gets a top separator.
-		unset PREVIOUS_CHECK_HAD_OUTPUT
+	# else
+	# 	# Unset the flag if the check was silent, so the next report gets a top separator.
+	# 	unset PREVIOUS_CHECK_HAD_OUTPUT
 	fi
 }
 

@@ -14,7 +14,7 @@ This script is a minimalist, Bash-only tool inspired by the powerful and feature
 - **Simple YAML Configuration**: Define your jobs in an easy-to-read YAML file.
 - **Variable Substitution**: Use placeholders like `%%%VAR_NAME%%%` in commands, defined in an optional `globals.conf` for reusability and security (e.g., for API keys).
 - **Reserved Variables**: Access internal script data like `%%%SCRIPT_IDENTITY%%%` (e.g., `bash-url-watch v0.5.0`) for use in commands.
-- **Colored Diff**: Shows a clear, colored `diff` when changes are detected. Can optionally use `colordiff` if installed.
+- **Colored Diff**: Shows a clear, colored `diff` when changes are detected.
 - **XDG Compliant**: Follows the XDG Base Directory Specification for configuration and state files.
 - **Minimal Dependencies**: Requires only `diff` and `yq`.
 - **Summary Report**: Provides a clean summary of what has changed after running.
@@ -23,7 +23,6 @@ This script is a minimalist, Bash-only tool inspired by the powerful and feature
 
 - `diff` (from `diffutils`)
 - [yq](https://github.com/mikefarah/yq/) (a portable command-line YAML processor)
-- **Optional**: [colordiff](https://www.colordiff.org/) for enhanced diff highlighting. The script will use it if it's available in your `PATH`.
 
 ## Installation
 

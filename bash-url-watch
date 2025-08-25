@@ -210,14 +210,19 @@ function run_check() {
 	else
 		local DIFF_RENDERED
 		# Generate the diff output. The command used depends on whether color is enabled.
+		local RAW_DIFF
+		RAW_DIFF=$(diff -u "${STATE_FILE}" <(echo "${NEW_OUTPUT}"))
 		if [[ ${IS_INTERACTIVE} -eq 1 ]]; then
-			if command -v colordiff &> /dev/null; then
-				DIFF_RENDERED=$(colordiff -u "${STATE_FILE}" <(echo "${NEW_OUTPUT}"))
-			else
-				DIFF_RENDERED=$(diff --color=always -u "${STATE_FILE}" <(echo "${NEW_OUTPUT}"))
-			fi
+			# If color is enabled, filter the diff and color it line-by-line.
+			DIFF_RENDERED=$(echo "${RAW_DIFF}" | grep '^[-+]' | grep -Ev '^(---|\+\+\+)' | while IFS= read -r line; do
+				case "${line}" in
+					+*) echo -e "${GREEN}${line}${NC}" ;;
+					-*) echo -e "${RED}${line}${NC}" ;;
+				esac
+			done)
 		else
-			DIFF_RENDERED=$(diff -u "${STATE_FILE}" <(echo "${NEW_OUTPUT}"))
+			# If color is disabled, just filter the diff.
+			DIFF_RENDERED=$(echo "${RAW_DIFF}" | grep '^[-+]' | grep -Ev '^(---|\+\+\+)')
 		fi
 
 		# If the diff output is not empty, there was a change.
@@ -241,8 +246,9 @@ function run_check() {
 			echo -e "${MAGENTA}${SEPARATOR}${NC}"
 		fi
 
-		echo -e "${CYAN}Checking: ${NAME}${NC}"
-		echo -e "${REPORT_MESSAGE}"
+		echo -e "${CYAN}Name:    ${NC}${NAME}"
+		echo -e "${CYAN}Command: ${NC}${COMMAND}"
+		echo -e "\n${REPORT_MESSAGE}"
 		echo -e "${MAGENTA}${SEPARATOR}${NC}"
 
 		PREVIOUS_CHECK_HAD_OUTPUT=true
